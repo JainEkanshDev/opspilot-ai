@@ -1,0 +1,27 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Node.js dependencies
+node_modules/
+
+# Compiled backend output
+backend/dist/
+frontend/dist/
+
+# Python virtual environment and cache
+ai-service/.venv/
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+
+# IDE settings
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
