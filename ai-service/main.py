@@ -2,11 +2,13 @@
 import json
 import logging
 from typing import Literal
-
+from rag_service import answer_question,ingest_pdf
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException,UploadFile, File
 from pydantic import BaseModel, Field, ValidationError
-
+from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+from uuid import uuid4
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,17 @@ app = FastAPI(
     title="OpsPilot AI Service",
     description="Local AI service for task interpretation",
     version="0.2.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -111,3 +124,117 @@ Rules:
             status_code=502,
             detail="The AI model did not return a valid task interpretation.",
         ) from None
+
+
+class RagQuestionRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+
+
+@app.post("/api/rag/ask")
+def ask_rag_question(body: RagQuestionRequest):
+    try:
+        result = answer_question(body.question)
+
+        return {
+            "success": True,
+            "answer": result["answer"],
+            "sources": result["sources"],
+        }
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from None
+
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot connect to Ollama. Check that Ollama is running.",
+        ) from None
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="The AI service timed out while processing the question.",
+        ) from None
+
+    except httpx.HTTPStatusError:
+        logger.exception("Ollama returned an HTTP error during RAG")
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama failed to process the RAG request.",
+        ) from None
+
+    except Exception:
+        logger.exception("Unexpected error while processing RAG question")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process the RAG question.",
+        ) from None
+
+
+UPLOAD_DIR = Path(__file__).resolve().parent / "documents" / "uploads"
+MAX_PDF_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+@app.post("/api/rag/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Please select a PDF file.",
+        )
+
+    if Path(file.filename).suffix.lower() != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported.",
+        )
+
+    content = await file.read(MAX_PDF_SIZE + 1)
+
+    if len(content) > MAX_PDF_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="PDF must be 10 MB or smaller.",
+        )
+
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not a valid PDF.",
+        )
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Generate a unique filename to avoid overwriting existing files.
+    saved_name = f"{uuid4().hex}.pdf"
+    file_path = UPLOAD_DIR / saved_name
+
+    try:
+        file_path.write_bytes(content)
+
+        # Reuse your existing PDF extraction, chunking,
+        # embedding, and ChromaDB indexing pipeline.
+        ingest_pdf(str(file_path))
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            "message": "PDF uploaded and indexed successfully.",
+        }
+
+    except Exception as exc:
+        # Do not leave a partially processed file behind.
+        file_path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process and index the PDF.",
+        ) from exc
+
+    finally:
+        await file.close()
+    
+    

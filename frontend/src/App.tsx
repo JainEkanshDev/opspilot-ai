@@ -1,250 +1,204 @@
 
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import './App.css'
 
 const API_URL = 'http://localhost:3000'
-const USER_ID = 1 // Local development user
+const AI_SERVICE_URL = 'http://localhost:8000'
+const USER_ID = 1
+const MAX_PDF_SIZE = 10 * 1024 * 1024
 
-type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed'
-type Priority = 'low' | 'medium' | 'high' | 'urgent'
+type TaskStatus = 'pending' | 'in_progress' | 'completed'
+type TaskPriority = 'low' | 'medium' | 'high' | 'urgent'
 
 interface Task {
   id: number
-  user_id: number
   title: string
-  description: string | null
+  description?: string | null
   status: TaskStatus
-  priority: Priority
-  created_at: string
-}
-
-interface ApiTaskResponse {
-  success: boolean
-  data: Task[]
-  message?: string
+  priority: TaskPriority
+  created_at?: string
+  updated_at?: string
 }
 
 interface TaskEvent {
   id: number
   task_id: number
   event_type: string
-  details: Record<string, unknown> | string | null
+  details?: unknown
   created_at: string
 }
 
 interface TaskActivityResponse {
   success: boolean
-  taskId: number
-  data: TaskEvent[]
+  events: TaskEvent[]
+}
+
+interface ApiTaskResponse {
+  success: boolean
+  data?: Task
+  task?: Task
   message?: string
 }
 
-interface ApiErrorResponse {
-  success?: boolean
-  message?: string
-  detail?: string
+interface RagSource {
+  label: string
+  source: string
+  chunk_index: number
+  distance?: number
 }
 
-const statuses: TaskStatus[] = [
-  'pending',
-  'in_progress',
-  'completed',
-  'failed',
-]
+interface RagResponse {
+  success: boolean
+  answer: string
+  sources: RagSource[]
+}
 
-function formatStatus(status: TaskStatus) {
+interface UploadResponse {
+  success: boolean
+  filename: string
+  message: string
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Something went wrong.'
+}
+
+async function readResponse<T>(response: Response): Promise<T> {
+  const body: unknown = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    const errorBody = body as { detail?: string; message?: string }
+    throw new Error(
+      errorBody.detail || errorBody.message || `Request failed (${response.status})`,
+    )
+  }
+
+  return body as T
+}
+
+function formatStatus(status: TaskStatus): string {
   return status.replace('_', ' ')
 }
 
-function formatEventName(eventType: string) {
-  if (eventType === 'created_by_ai') return 'Created by AI'
-  if (eventType === 'status_changed') return 'Status changed'
-
+function formatEventName(eventType: string): string {
   return eventType.replaceAll('_', ' ')
 }
 
-function formatEventDetails(
-  details: TaskEvent['details'],
-): string[] {
-  let parsed: unknown = details
+function formatEventDetails(details: unknown): string {
+  if (details == null) return ''
+
+  let parsed = details
 
   if (typeof parsed === 'string') {
     try {
       parsed = JSON.parse(parsed)
     } catch {
-  return typeof parsed === 'string' && parsed
-    ? [parsed]
-    : []
-}
+    return typeof details === 'string' ? details : ''
+  }
   }
 
-  if (
-    !parsed ||
-    typeof parsed !== 'object' ||
-    Array.isArray(parsed)
-  ) {
-    return []
+  if (typeof parsed === 'object') {
+    return Object.entries(parsed as Record<string, unknown>)
+      .map(([key, value]) => `${key.replaceAll('_', ' ')}: ${String(value)}`)
+      .join(' · ')
   }
 
-  return Object.entries(parsed as Record<string, unknown>).map(
-    ([key, value]) => {
-      const readableKey = key
-        .replace(/([A-Z])/g, ' $1')
-        .replaceAll('_', ' ')
-
-      const readableValue =
-        typeof value === 'string'
-          ? value
-          : JSON.stringify(value)
-
-      return `${readableKey}: ${readableValue ?? '—'}`
-    },
-  )
-}
-
-async function getErrorMessage(response: Response) {
-  try {
-    const result: ApiErrorResponse = await response.json()
-
-    return (
-      result.message ||
-      result.detail ||
-      `Request failed with status ${response.status}.`
-    )
-  } catch {
-    return `Request failed with status ${response.status}.`
-  }
+  return String(parsed)
 }
 
 function App() {
   const [tasks, setTasks] = useState<Task[]>([])
-  const [request, setRequest] = useState('')
-
   const [loadingTasks, setLoadingTasks] = useState(true)
+  const [request, setRequest] = useState('')
   const [creatingTask, setCreatingTask] = useState(false)
-  const [updatingTaskId, setUpdatingTaskId] = useState<number | null>(
-    null,
-  )
+  const [updatingTaskId, setUpdatingTaskId] = useState<number | null>(null)
+  const [pageError, setPageError] = useState('')
+  const [notice, setNotice] = useState('')
 
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
   const [taskEvents, setTaskEvents] = useState<TaskEvent[]>([])
   const [loadingActivity, setLoadingActivity] = useState(false)
   const [activityError, setActivityError] = useState('')
 
-  const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
+  const [selectedPdf, setSelectedPdf] = useState<File | null>(null)
+  const [uploadingPdf, setUploadingPdf] = useState(false)
+  const [uploadMessage, setUploadMessage] = useState('')
+  const [uploadError, setUploadError] = useState('')
 
-  const loadTasks = useCallback(async () => {
+  const [ragQuestion, setRagQuestion] = useState('')
+  const [ragAnswer, setRagAnswer] = useState('')
+  const [ragSources, setRagSources] = useState<RagSource[]>([])
+  const [askingRag, setAskingRag] = useState(false)
+  const [ragError, setRagError] = useState('')
+
+  async function loadTasks() {
     setLoadingTasks(true)
-    setError('')
+    setPageError('')
 
     try {
       const response = await fetch(`${API_URL}/api/tasks`)
-
-      if (!response.ok) {
-        throw new Error(await getErrorMessage(response))
-      }
-
-      const result: ApiTaskResponse = await response.json()
-
-      if (!result.success || !Array.isArray(result.data)) {
-        throw new Error('The backend returned an invalid task list.')
-      }
-
-      setTasks(result.data)
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : 'Cannot connect to the backend. Make sure Node.js and MySQL are running.',
-      )
+      const result = await readResponse<{ success: boolean; data?: Task[]; tasks?: Task[] }>(response)
+      setTasks(result.data ?? result.tasks ?? [])
+    } catch (error) {
+      setPageError(getErrorMessage(error))
     } finally {
       setLoadingTasks(false)
     }
-  }, [])
+  }
 
   useEffect(() => {
     void loadTasks()
-  }, [loadTasks])
+  }, [])
 
-  async function createTask(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-
-    if (request.trim().length < 3) return
+  async function createTask() {
+    if (request.trim().length < 3) {
+      setPageError('Enter a task request with at least 3 characters.')
+      return
+    }
 
     setCreatingTask(true)
-    setError('')
+    setPageError('')
     setNotice('')
 
     try {
       const response = await fetch(`${API_URL}/api/ai/tasks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: USER_ID,
-          request: request.trim(),
-        }),
+        body: JSON.stringify({ request: request.trim(), user_id: USER_ID }),
       })
 
-      if (!response.ok) {
-        throw new Error(await getErrorMessage(response))
-      }
-
-      const result = await response.json()
-
-      setNotice(`Task #${result.taskId} created successfully.`)
+      const result = await readResponse<ApiTaskResponse>(response)
       setRequest('')
-
+      setNotice(result.message || 'Task created successfully.')
       await loadTasks()
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : 'AI task creation failed.',
-      )
+    } catch (error) {
+      setPageError(getErrorMessage(error))
     } finally {
       setCreatingTask(false)
     }
   }
 
-  async function updateTaskStatus(
-    taskId: number,
-    status: TaskStatus,
-  ) {
-    setUpdatingTaskId(taskId)
-    setError('')
+  async function updateTaskStatus(task: Task, status: TaskStatus) {
+    setUpdatingTaskId(task.id)
+    setPageError('')
     setNotice('')
 
     try {
-      const response = await fetch(
-        `${API_URL}/api/tasks/${taskId}/status`,
-        {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status }),
-        },
-      )
+      const response = await fetch(`${API_URL}/api/tasks/${task.id}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      })
 
-      if (!response.ok) {
-        throw new Error(await getErrorMessage(response))
-      }
-
-      setNotice(
-        `Task #${taskId} updated to ${formatStatus(status)}.`,
-      )
-
+      await readResponse(response)
+      setNotice(`Task #${task.id} marked ${formatStatus(status)}.`)
       await loadTasks()
 
-      // Refresh activity too if this task's history panel is open.
-      if (selectedTask?.id === taskId) {
-        await viewActivity({ ...selectedTask, status })
+      if (selectedTask?.id === task.id) {
+        await viewActivity(task)
       }
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : 'Could not update task status.',
-      )
+    } catch (error) {
+      setPageError(getErrorMessage(error))
     } finally {
       setUpdatingTaskId(null)
     }
@@ -257,315 +211,361 @@ function App() {
     setLoadingActivity(true)
 
     try {
-      const response = await fetch(
-        `${API_URL}/api/tasks/${task.id}/activity`,
-      )
-
-      if (!response.ok) {
-        throw new Error(await getErrorMessage(response))
-      }
-
-      const result: TaskActivityResponse = await response.json()
-
-      if (!result.success || !Array.isArray(result.data)) {
-        throw new Error('The backend returned invalid activity data.')
-      }
-
-      setTaskEvents(result.data)
-    } catch (err) {
-      setActivityError(
-        err instanceof Error
-          ? err.message
-          : 'Could not load task activity.',
-      )
+      const response = await fetch(`${API_URL}/api/tasks/${task.id}/activity`)
+      const result = await readResponse<TaskActivityResponse>(response)
+      setTaskEvents(result.events ?? [])
+    } catch (error) {
+      setActivityError(getErrorMessage(error))
     } finally {
       setLoadingActivity(false)
     }
   }
 
-  function closeActivity() {
-    setSelectedTask(null)
-    setTaskEvents([])
-    setActivityError('')
+  async function handlePdfUpload() {
+    if (!selectedPdf) {
+      setUploadError('Please select a PDF file first.')
+      return
+    }
+
+    if (selectedPdf.size > MAX_PDF_SIZE) {
+      setUploadError('The PDF must be 10 MB or smaller.')
+      return
+    }
+
+    if (
+      selectedPdf.type !== 'application/pdf' &&
+      !selectedPdf.name.toLowerCase().endsWith('.pdf')
+    ) {
+      setUploadError('Please select a PDF file.')
+      return
+    }
+
+    setUploadingPdf(true)
+    setUploadMessage('')
+    setUploadError('')
+
+    const formData = new FormData()
+    formData.append('file', selectedPdf)
+
+    try {
+      const response = await fetch(`${AI_SERVICE_URL}/api/rag/upload`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      const result = await readResponse<UploadResponse>(response)
+
+      setUploadMessage(result.message || 'PDF uploaded and indexed successfully.')
+      setSelectedPdf(null)
+
+      const input = document.getElementById('pdf-upload') as HTMLInputElement | null
+      if (input) input.value = ''
+    } catch (error) {
+      setUploadError(getErrorMessage(error))
+    } finally {
+      setUploadingPdf(false)
+    }
   }
 
-  const pendingCount = tasks.filter(
-    (task) => task.status === 'pending',
-  ).length
+  async function askDocumentQuestion() {
+    if (ragQuestion.trim().length < 3) {
+      setRagError('Enter a question with at least 3 characters.')
+      return
+    }
 
-  const activeCount = tasks.filter(
-    (task) => task.status === 'in_progress',
-  ).length
+    setAskingRag(true)
+    setRagError('')
+    setRagAnswer('')
+    setRagSources([])
 
-  const completedCount = tasks.filter(
-    (task) => task.status === 'completed',
-  ).length
+    try {
+      const response = await fetch(`${AI_SERVICE_URL}/api/rag/ask`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: ragQuestion.trim() }),
+      })
 
-  const urgentCount = tasks.filter(
-    (task) =>
-      task.priority === 'urgent' && task.status !== 'completed',
-  ).length
+      const result = await readResponse<RagResponse>(response)
+      setRagAnswer(result.answer)
+      setRagSources(result.sources ?? [])
+    } catch (error) {
+      setRagError(getErrorMessage(error))
+    } finally {
+      setAskingRag(false)
+    }
+  }
+
+  const completedTasks = tasks.filter((task) => task.status === 'completed').length
+  const activeTasks = tasks.filter((task) => task.status === 'in_progress').length
+  const pendingTasks = tasks.filter((task) => task.status === 'pending').length
 
   return (
-    <main className="app-shell">
+    <div className="app-shell">
       <aside className="sidebar">
-        <a className="brand" href="#dashboard">
-          <span className="brand-icon">O</span>
-          <span>
-            OpsPilot<span className="brand-ai"> AI</span>
-          </span>
-        </a>
+        <div className="brand">
+          <div className="brand-mark">O</div>
+          <div>
+            <strong>OpsPilot</strong>
+            <span>AI WORKSPACE</span>
+          </div>
+        </div>
 
-        <p className="nav-heading">WORKSPACE</p>
-
-        <a className="nav-link active" href="#dashboard">
-          <span>▦</span> Dashboard
-        </a>
-
-        <a className="nav-link" href="#tasks">
-          <span>☷</span> My tasks
-        </a>
-
-        <a className="nav-link" href="#ai-assistant">
-          <span>✳</span> AI assistant
-        </a>
+        <p className="sidebar-label">WORKSPACE</p>
+        <a className="sidebar-link active" href="#overview">Overview</a>
+        <a className="sidebar-link" href="#tasks">Tasks</a>
+        <a className="sidebar-link" href="#documents">Knowledge base</a>
 
         <div className="sidebar-bottom">
-          <span className="online-dot" />
+          <div className="avatar">O</div>
           <div>
-            <strong>Local AI</strong>
-            <p>Ollama · Llama 3.2</p>
+            <strong>Workspace user</strong>
+            <span>Local development</span>
           </div>
         </div>
       </aside>
 
-      <section className="main-content" id="dashboard">
+      <main className="main-content" id="overview">
         <header className="topbar">
           <div>
-            <p className="eyebrow">WORKSPACE / OVERVIEW</p>
-            <h1>Task dashboard</h1>
+            <p className="eyebrow">OPERATIONS WORKSPACE</p>
+            <h1>Good to see you</h1>
+            <p className="muted">Manage work and get answers from your documents.</p>
           </div>
-
-          <button
-            className="secondary-button"
-            onClick={() => void loadTasks()}
-            disabled={loadingTasks}
-          >
-            ↻ Refresh
-          </button>
+          <div className="status-pill">
+            <span className="status-dot" />
+            Local AI connected
+          </div>
         </header>
 
-        <section className="welcome-banner">
-          <div className="welcome-copy">
-            <span className="banner-label">YOUR AI WORKSPACE</span>
-            <h2>Get things done, smarter.</h2>
-            <p>
-              Describe what needs to be done. Let your local AI
-              interpret the request and create a task.
-            </p>
-            <a href="#ai-assistant" className="banner-link">
-              Create with AI <span>→</span>
-            </a>
-          </div>
+        {pageError && <div className="error-banner" role="alert">{pageError}</div>}
+        {notice && <div className="success-banner" role="status">{notice}</div>}
 
-          <div className="banner-art" aria-hidden="true">
-            <div className="orbit orbit-one" />
-            <div className="orbit orbit-two" />
-            <div className="ai-core">✳</div>
-            <span className="floating-chip chip-one">AI</span>
-            <span className="floating-chip chip-two">✓</span>
-          </div>
-        </section>
-
-        <section className="stats-grid" aria-label="Task summary">
+        <section className="stats-grid">
           <article className="stat-card">
-            <span className="stat-icon purple">▦</span>
-            <p>Total tasks</p>
+            <span className="stat-label">Total tasks</span>
             <strong>{tasks.length}</strong>
-            <span className="stat-caption">
-              Across your workspace
-            </span>
+            <span className="stat-caption">Across your workspace</span>
           </article>
-
           <article className="stat-card">
-            <span className="stat-icon orange">◷</span>
-            <p>Pending</p>
-            <strong>{pendingCount}</strong>
-            <span className="stat-caption">
-              Waiting to be started
-            </span>
+            <span className="stat-label">Pending</span>
+            <strong>{pendingTasks}</strong>
+            <span className="stat-caption">Waiting to start</span>
           </article>
-
           <article className="stat-card">
-            <span className="stat-icon blue">↗</span>
-            <p>In progress</p>
-            <strong>{activeCount}</strong>
-            <span className="stat-caption">
-              Currently being worked on
-            </span>
+            <span className="stat-label">In progress</span>
+            <strong>{activeTasks}</strong>
+            <span className="stat-caption">Currently underway</span>
           </article>
-
           <article className="stat-card">
-            <span className="stat-icon green">✓</span>
-            <p>Completed</p>
-            <strong>{completedCount}</strong>
-            <span className="stat-caption">
-              {urgentCount} urgent task{urgentCount === 1 ? '' : 's'} open
-            </span>
+            <span className="stat-label">Completed</span>
+            <strong>{completedTasks}</strong>
+            <span className="stat-caption">Successfully finished</span>
           </article>
         </section>
 
-        <section className="ai-panel" id="ai-assistant">
-          <div className="section-heading">
+        <section className="panel task-create-panel">
+          <div className="panel-heading">
             <div>
-              <span className="section-kicker">AI ASSISTANT</span>
-              <h2>Create a task with natural language</h2>
-              <p>
-                No forms to fill out. Just tell OpsPilot what you need.
-              </p>
+              <p className="eyebrow">AI TASK ASSISTANT</p>
+              <h2>What needs to get done?</h2>
+              <p className="muted">Describe the task in plain English and let AI structure it.</p>
             </div>
-
-            <span className="model-badge">
-              <span /> LLAMA 3.2
-            </span>
+            <span className="feature-pill">AI powered</span>
           </div>
 
-          <form onSubmit={createTask} className="prompt-form">
+          <form
+            onSubmit={(event) => {
+              event.preventDefault()
+              void createTask()
+            }}
+          >
             <textarea
               value={request}
               onChange={(event) => setRequest(event.target.value)}
-              placeholder="e.g. Create a high-priority task to investigate slow database queries..."
-              maxLength={2000}
-              minLength={3}
-              required
+              placeholder="e.g. Investigate slow database queries and mark it as high priority..."
               rows={3}
-              aria-label="Describe the task you want to create"
+              maxLength={2000}
+            />
+            <div className="form-footer">
+              <span className="muted">Be as descriptive as you need.</span>
+              <button type="submit" disabled={creatingTask || request.trim().length < 3}>
+                {creatingTask ? 'Creating task...' : 'Create task →'}
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <section className="panel upload-panel" id="documents">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">KNOWLEDGE BASE</p>
+              <h2>Upload a document</h2>
+              <p className="muted">Add a PDF to your local AI knowledge base.</p>
+            </div>
+            <span className="feature-pill">PDF · Max 10 MB</span>
+          </div>
+
+          <div className="upload-controls">
+            <input
+              id="pdf-upload"
+              type="file"
+              accept=".pdf,application/pdf"
+              disabled={uploadingPdf}
+              onChange={(event) => {
+                const file = event.target.files?.[0] ?? null
+                setSelectedPdf(file)
+                setUploadMessage('')
+                setUploadError('')
+              }}
             />
 
-            <div className="prompt-footer">
-              <span>Powered by your local AI model</span>
+            <button
+              type="button"
+              onClick={() => void handlePdfUpload()}
+              disabled={!selectedPdf || uploadingPdf}
+            >
+              {uploadingPdf ? 'Indexing PDF...' : 'Upload PDF →'}
+            </button>
+          </div>
 
-              <button
-                className="primary-button"
-                type="submit"
-                disabled={creatingTask || request.trim().length < 3}
-              >
-                {creatingTask ? 'Thinking...' : '✳ Create with AI →'}
+          {selectedPdf && (
+            <p className="upload-file-name">
+              Selected: {selectedPdf.name} · {(selectedPdf.size / (1024 * 1024)).toFixed(2)} MB
+            </p>
+          )}
+
+          {uploadingPdf && (
+            <p className="muted" role="status">
+              Uploading and indexing your document. This may take a little while.
+            </p>
+          )}
+
+          {uploadMessage && <p className="upload-success" role="status">{uploadMessage}</p>}
+          {uploadError && <p className="upload-error" role="alert">{uploadError}</p>}
+        </section>
+
+        <section className="panel rag-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">KNOWLEDGE ASSISTANT</p>
+              <h2>Ask your documents</h2>
+              <p className="muted">Ask questions about indexed documents and get answers grounded in their content.</p>
+            </div>
+            <span className="feature-pill">RAG + LLAMA 3.2</span>
+          </div>
+
+          <form
+            onSubmit={(event) => {
+              event.preventDefault()
+              void askDocumentQuestion()
+            }}
+          >
+            <textarea
+              value={ragQuestion}
+              onChange={(event) => setRagQuestion(event.target.value)}
+              placeholder="e.g. What should engineers do when database queries become slow?"
+              rows={3}
+              maxLength={2000}
+            />
+            <div className="form-footer">
+              <span className="muted">Answers use locally indexed documents.</span>
+              <button type="submit" disabled={askingRag || ragQuestion.trim().length < 3}>
+                {askingRag ? 'Searching documents...' : 'Ask question →'}
               </button>
             </div>
           </form>
 
-          {notice && (
-            <p className="notice-message" role="status">
-              {notice}
-            </p>
-          )}
+          {ragError && <p className="upload-error" role="alert">{ragError}</p>}
 
-          {error && (
-            <p className="error-message" role="alert">
-              {error}
-            </p>
+          {ragAnswer && (
+            <div className="rag-answer">
+              <h3>Answer</h3>
+              <p className="rag-answer-text">{ragAnswer}</p>
+
+              {ragSources.length > 0 && (
+                <div className="rag-sources">
+                  <h3>Sources</h3>
+                  {ragSources.map((source, index) => (
+                    <article
+                      className="rag-source"
+                      key={`${source.source}-${source.chunk_index}-${index}`}
+                    >
+                      <strong>{source.label}: {source.source}</strong>
+                      <p>
+                        Chunk {source.chunk_index}
+                        {source.distance !== undefined
+                          ? ` · Distance: ${source.distance.toFixed(3)}`
+                          : ''}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </section>
 
-        <section className="tasks-section" id="tasks">
-          <div className="section-heading task-heading">
+        <section className="panel tasks-panel" id="tasks">
+          <div className="panel-heading">
             <div>
-              <span className="section-kicker">YOUR WORK</span>
+              <p className="eyebrow">YOUR WORK</p>
               <h2>Recent tasks</h2>
-              <p>Review tasks and update their progress.</p>
+              <p className="muted">Track progress and review task activity.</p>
             </div>
-
-            <span className="task-count">
-              {tasks.length} tasks
-            </span>
+            <span className="feature-pill">{tasks.length} tasks</span>
           </div>
 
           {loadingTasks ? (
-            <div className="empty-state">Loading your tasks...</div>
+            <p className="muted">Loading tasks...</p>
           ) : tasks.length === 0 ? (
             <div className="empty-state">
-              <span className="empty-icon">☷</span>
               <h3>No tasks yet</h3>
-              <p>
-                Use the AI assistant above to create your first task.
-              </p>
+              <p>Create your first task using the AI assistant above.</p>
             </div>
           ) : (
             <div className="task-list">
               {tasks.map((task) => (
-                <article className="task-row" key={task.id}>
-                  <span
-                    className={`task-check ${
-                      task.status === 'completed' ? 'checked' : ''
-                    }`}
-                  >
-                    {task.status === 'completed' ? '✓' : '○'}
-                  </span>
-
-                  <div className="task-details">
-                    <h3>{task.title}</h3>
-
-                    {task.description && (
-                      <p className="task-description">
-                        {task.description}
-                      </p>
-                    )}
-
-                    <div className="task-meta">
-                      <span>#{task.id}</span>
-
-                      <span
-                        className={`priority priority-${task.priority}`}
-                      >
+                <article className="task-item" key={task.id}>
+                  <div className="task-main">
+                    <div className="task-title-row">
+                      <h3>{task.title}</h3>
+                      <span className={`priority-badge priority-${task.priority}`}>
                         {task.priority}
                       </span>
-
-                      <span className="task-date">
-                        {new Date(task.created_at).toLocaleDateString()}
+                    </div>
+                    {task.description && <p className="muted">{task.description}</p>}
+                    <div className="task-meta">
+                      <span>Task #{task.id}</span>
+                      <span className={`status-badge status-${task.status}`}>
+                        {formatStatus(task.status)}
                       </span>
                     </div>
                   </div>
 
-                  <button
-                    className="activity-button"
-                    onClick={() => void viewActivity(task)}
-                    disabled={loadingActivity && selectedTask?.id === task.id}
-                  >
-                    {loadingActivity && selectedTask?.id === task.id
-                      ? 'Loading...'
-                      : 'View activity'}
-                  </button>
-
-                  <div className="task-status-control">
-                    <label
-                      className="sr-only"
-                      htmlFor={`status-${task.id}`}
-                    >
-                      Status for {task.title}
+                  <div className="task-actions">
+                    <label className="sr-only" htmlFor={`status-${task.id}`}>
+                      Update status for {task.title}
                     </label>
-
                     <select
                       id={`status-${task.id}`}
                       value={task.status}
                       disabled={updatingTaskId === task.id}
-                      onChange={(event) =>
-                        void updateTaskStatus(
-                          task.id,
-                          event.target.value as TaskStatus,
-                        )
-                      }
+                      onChange={(event) => {
+                        void updateTaskStatus(task, event.target.value as TaskStatus)
+                      }}
                     >
-                      {statuses.map((status) => (
-                        <option value={status} key={status}>
-                          {formatStatus(status)}
-                        </option>
-                      ))}
+                      <option value="pending">Pending</option>
+                      <option value="in_progress">In progress</option>
+                      <option value="completed">Completed</option>
                     </select>
 
-                    {updatingTaskId === task.id && (
-                      <span className="updating-label">Saving...</span>
-                    )}
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => void viewActivity(task)}
+                    >
+                      Activity
+                    </button>
                   </div>
                 </article>
               ))}
@@ -574,56 +574,46 @@ function App() {
         </section>
 
         {selectedTask && (
-          <section
-            className="activity-panel"
-            aria-label="Task activity"
-            aria-live="polite"
-          >
-            <div className="activity-header">
+          <section className="panel activity-panel">
+            <div className="panel-heading">
               <div>
-                <span className="section-kicker">TASK HISTORY</span>
-                <h2>{selectedTask.title}</h2>
-                <p>Activity for task #{selectedTask.id}</p>
+                <p className="eyebrow">TASK HISTORY</p>
+                <h2>Activity · {selectedTask.title}</h2>
+                <p className="muted">Task #{selectedTask.id}</p>
               </div>
-
               <button
                 className="secondary-button"
-                onClick={closeActivity}
+                type="button"
+                onClick={() => {
+                  setSelectedTask(null)
+                  setTaskEvents([])
+                  setActivityError('')
+                }}
               >
                 Close
               </button>
             </div>
 
-            {loadingActivity ? (
-              <p className="activity-empty">Loading activity...</p>
-            ) : activityError ? (
-              <p className="error-message" role="alert">
-                {activityError}
-              </p>
-            ) : taskEvents.length === 0 ? (
-              <p className="activity-empty">
-                No activity has been recorded for this task yet.
-              </p>
-            ) : (
+            {loadingActivity && <p className="muted">Loading activity...</p>}
+            {activityError && <p className="upload-error" role="alert">{activityError}</p>}
+
+            {!loadingActivity && !activityError && taskEvents.length === 0 && (
+              <p className="muted">No activity has been recorded for this task yet.</p>
+            )}
+
+            {taskEvents.length > 0 && (
               <div className="activity-list">
                 {taskEvents.map((event) => (
                   <article className="activity-item" key={event.id}>
                     <span className="activity-dot" />
-
                     <div className="activity-content">
-                      <h3>{formatEventName(event.event_type)}</h3>
-
-                      {formatEventDetails(event.details).map(
-                        (detail, index) => (
-                          <p key={`${event.id}-${index}`}>
-                            {detail}
-                          </p>
-                        ),
+                      <strong>{formatEventName(event.event_type)}</strong>
+                      {event.details != null && (
+                        <p>{formatEventDetails(event.details)}</p>
                       )}
-
-                      <time dateTime={event.created_at}>
+                      <span className="muted">
                         {new Date(event.created_at).toLocaleString()}
-                      </time>
+                      </span>
                     </div>
                   </article>
                 ))}
@@ -633,11 +623,10 @@ function App() {
         )}
 
         <footer className="app-footer">
-          <span>OpsPilot AI</span>
-          <span>Built with React, Node.js, Python & Ollama</span>
+          OpsPilot AI · Local development workspace
         </footer>
-      </section>
-    </main>
+      </main>
+    </div>
   )
 }
 
