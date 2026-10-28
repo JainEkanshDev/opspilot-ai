@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, ValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from uuid import uuid4
+from agent_service import answer_with_agent
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -236,5 +237,24 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     finally:
         await file.close()
+
+class AgentChatRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+
+
+@app.post("/api/agent/chat")
+async def agent_chat(body: AgentChatRequest):
+    try:
+        return await answer_with_agent(body.question)
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=502,
+            detail="The AI agent could not process your request. "
+                   "Check that Ollama and the MCP server are running.",
+        )        
     
     

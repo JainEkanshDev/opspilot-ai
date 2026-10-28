@@ -1,11 +1,11 @@
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import type { FormEvent } from 'react'
 import './App.css'
 
 const API_URL = 'http://localhost:3000'
 const AI_SERVICE_URL = 'http://localhost:8000'
 const USER_ID = 1
-const MAX_PDF_SIZE = 10 * 1024 * 1024
 
 type TaskStatus = 'pending' | 'in_progress' | 'completed'
 type TaskPriority = 'low' | 'medium' | 'high' | 'urgent'
@@ -14,240 +14,366 @@ interface Task {
   id: number
   title: string
   description?: string | null
-  status: TaskStatus
-  priority: TaskPriority
+  status: TaskStatus | string
+  priority?: TaskPriority | string
   created_at?: string
   updated_at?: string
 }
 
 interface TaskEvent {
-  id: number
-  task_id: number
-  event_type: string
+  id?: number
+  event_type?: string
+  event_name?: string
   details?: unknown
-  created_at: string
+  created_at?: string
+  timestamp?: string
+  [key: string]: unknown
 }
 
 interface TaskActivityResponse {
-  success: boolean
-  events: TaskEvent[]
-}
-
-interface ApiTaskResponse {
-  success: boolean
-  data?: Task
+  success?: boolean
   task?: Task
+  events?: TaskEvent[]
+  activity?: TaskEvent[]
+  data?: TaskActivityResponse
   message?: string
 }
 
 interface RagSource {
-  label: string
-  source: string
-  chunk_index: number
+  label?: string
+  source?: string
+  chunk_index?: number
   distance?: number
 }
 
 interface RagResponse {
-  success: boolean
-  answer: string
-  sources: RagSource[]
+  success?: boolean
+  answer?: string
+  sources?: RagSource[]
+  detail?: string
+  message?: string
 }
 
 interface UploadResponse {
-  success: boolean
-  filename: string
-  message: string
+  success?: boolean
+  filename?: string
+  message?: string
+  detail?: string
 }
 
-function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'Something went wrong.'
+interface AgentTool {
+  name: string
+  arguments: Record<string, unknown>
+}
+
+interface AgentChatResponse {
+  success: boolean
+  answer: string
+  tools_used: AgentTool[]
 }
 
 async function readResponse<T>(response: Response): Promise<T> {
-  const body: unknown = await response.json().catch(() => ({}))
+  const text = await response.text()
+  let data: Record<string, unknown> = {}
 
-  if (!response.ok) {
-    const errorBody = body as { detail?: string; message?: string }
-    throw new Error(
-      errorBody.detail || errorBody.message || `Request failed (${response.status})`,
-    )
+  if (text) {
+    try {
+      data = JSON.parse(text) as Record<string, unknown>
+    } catch {
+      throw new Error('The server returned an invalid response.')
+    }
   }
 
-  return body as T
+  if (!response.ok) {
+    const message =
+      typeof data.detail === 'string'
+        ? data.detail
+        : typeof data.message === 'string'
+          ? data.message
+          : `Request failed with status ${response.status}`
+
+    throw new Error(message)
+  }
+
+  return data as T
 }
 
-function formatStatus(status: TaskStatus): string {
-  return status.replace('_', ' ')
+function formatStatus(status?: string): string {
+  if (!status) return 'Unknown'
+
+  return status
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
 }
 
-function formatEventName(eventType: string): string {
-  return eventType.replaceAll('_', ' ')
+function formatEventName(event: TaskEvent): string {
+  const name = event.event_type ?? event.event_name ?? 'Activity'
+
+  return name
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
 }
 
 function formatEventDetails(details: unknown): string {
-  if (details == null) return ''
+  if (details == null || details === '') return ''
 
-  let parsed = details
-
-  if (typeof parsed === 'string') {
+  if (typeof details === 'string') {
     try {
-      parsed = JSON.parse(parsed)
+      const parsed: unknown = JSON.parse(details)
+
+      if (typeof parsed === 'object' && parsed !== null) {
+        return Object.entries(parsed)
+          .map(([key, value]) => `${formatStatus(key)}: ${String(value)}`)
+          .join(' · ')
+      }
+
+      return String(parsed)
     } catch {
-    return typeof details === 'string' ? details : ''
-  }
+      return details
+    }
   }
 
-  if (typeof parsed === 'object') {
-    return Object.entries(parsed as Record<string, unknown>)
-      .map(([key, value]) => `${key.replaceAll('_', ' ')}: ${String(value)}`)
+  if (typeof details === 'object') {
+    return Object.entries(details as Record<string, unknown>)
+      .map(([key, value]) => `${formatStatus(key)}: ${String(value)}`)
       .join(' · ')
   }
 
-  return String(parsed)
+  return String(details)
+}
+
+function getStatusClass(status?: string): string {
+  switch (status?.toLowerCase()) {
+    case 'completed':
+      return 'completed'
+    case 'in_progress':
+      return 'in-progress'
+    default:
+      return 'pending'
+  }
+}
+
+function getPriorityClass(priority?: string): string {
+  switch (priority?.toLowerCase()) {
+    case 'urgent':
+      return 'urgent'
+    case 'high':
+      return 'high'
+    case 'medium':
+      return 'medium'
+    default:
+      return 'low'
+  }
+}
+
+function formatDate(value?: string): string {
+  if (!value) return 'Date unavailable'
+
+  const date = new Date(value)
+
+  if (Number.isNaN(date.getTime())) return value
+
+  return date.toLocaleString()
+}
+
+function extractTasks(payload: unknown): Task[] {
+  if (Array.isArray(payload)) return payload as Task[]
+
+  if (typeof payload === 'object' && payload !== null) {
+    const data = payload as Record<string, unknown>
+
+    if (Array.isArray(data.tasks)) return data.tasks as Task[]
+    if (Array.isArray(data.data)) return data.data as Task[]
+    if (
+      typeof data.data === 'object' &&
+      data.data !== null &&
+      Array.isArray((data.data as Record<string, unknown>).tasks)
+    ) {
+      return (data.data as { tasks: Task[] }).tasks
+    }
+  }
+
+  return []
 }
 
 function App() {
   const [tasks, setTasks] = useState<Task[]>([])
-  const [loadingTasks, setLoadingTasks] = useState(true)
-  const [request, setRequest] = useState('')
-  const [creatingTask, setCreatingTask] = useState(false)
-  const [updatingTaskId, setUpdatingTaskId] = useState<number | null>(null)
-  const [pageError, setPageError] = useState('')
+  const [tasksLoading, setTasksLoading] = useState(true)
+  const [tasksError, setTasksError] = useState('')
   const [notice, setNotice] = useState('')
 
+  // Natural-language task creation
+  const [taskRequest, setTaskRequest] = useState('')
+  const [creatingTask, setCreatingTask] = useState(false)
+
+  // Task activity
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
-  const [taskEvents, setTaskEvents] = useState<TaskEvent[]>([])
-  const [loadingActivity, setLoadingActivity] = useState(false)
+  const [taskActivity, setTaskActivity] = useState<TaskEvent[]>([])
+  const [activityLoading, setActivityLoading] = useState(false)
   const [activityError, setActivityError] = useState('')
 
-  const [selectedPdf, setSelectedPdf] = useState<File | null>(null)
-  const [uploadingPdf, setUploadingPdf] = useState(false)
+  // PDF upload
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [uploadLoading, setUploadLoading] = useState(false)
   const [uploadMessage, setUploadMessage] = useState('')
   const [uploadError, setUploadError] = useState('')
 
+  // Document Q&A (RAG)
   const [ragQuestion, setRagQuestion] = useState('')
-  const [ragAnswer, setRagAnswer] = useState('')
-  const [ragSources, setRagSources] = useState<RagSource[]>([])
-  const [askingRag, setAskingRag] = useState(false)
+  const [ragLoading, setRagLoading] = useState(false)
+  const [ragResponse, setRagResponse] = useState<RagResponse | null>(null)
   const [ragError, setRagError] = useState('')
 
-  async function loadTasks() {
-    setLoadingTasks(true)
-    setPageError('')
+  // MCP-powered AI chat
+  const [agentQuestion, setAgentQuestion] = useState('')
+  const [agentAnswer, setAgentAnswer] = useState<AgentChatResponse | null>(null)
+  const [agentLoading, setAgentLoading] = useState(false)
+  const [agentError, setAgentError] = useState('')
+
+  const loadTasks = useCallback(async () => {
+    setTasksLoading(true)
+    setTasksError('')
 
     try {
       const response = await fetch(`${API_URL}/api/tasks`)
-      const result = await readResponse<{ success: boolean; data?: Task[]; tasks?: Task[] }>(response)
-      setTasks(result.data ?? result.tasks ?? [])
+      const payload: unknown = await readResponse(response)
+      setTasks(extractTasks(payload))
     } catch (error) {
-      setPageError(getErrorMessage(error))
+      setTasksError(
+        error instanceof Error ? error.message : 'Unable to load tasks.',
+      )
     } finally {
-      setLoadingTasks(false)
+      setTasksLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     void loadTasks()
-  }, [])
+  }, [loadTasks])
 
-  async function createTask() {
-    if (request.trim().length < 3) {
-      setPageError('Enter a task request with at least 3 characters.')
+  async function handleCreateTask(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    const request = taskRequest.trim()
+
+    if (request.length < 3) {
+      setNotice('Please describe the task in a little more detail.')
       return
     }
 
     setCreatingTask(true)
-    setPageError('')
     setNotice('')
+    setTasksError('')
 
     try {
       const response = await fetch(`${API_URL}/api/ai/tasks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ request: request.trim(), user_id: USER_ID }),
+        body: JSON.stringify({
+          request,
+          user_id: USER_ID,
+        }),
       })
 
-      const result = await readResponse<ApiTaskResponse>(response)
-      setRequest('')
-      setNotice(result.message || 'Task created successfully.')
+      await readResponse(response)
+      setTaskRequest('')
+      setNotice('Task created successfully.')
       await loadTasks()
     } catch (error) {
-      setPageError(getErrorMessage(error))
+      setTasksError(
+        error instanceof Error ? error.message : 'Unable to create task.',
+      )
     } finally {
       setCreatingTask(false)
     }
   }
 
-  async function updateTaskStatus(task: Task, status: TaskStatus) {
-    setUpdatingTaskId(task.id)
-    setPageError('')
+  async function handleStatusChange(
+    task: Task,
+    status: TaskStatus,
+  ) {
     setNotice('')
+    setTasksError('')
 
     try {
-      const response = await fetch(`${API_URL}/api/tasks/${task.id}/status`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
-      })
+      const response = await fetch(
+        `${API_URL}/api/tasks/${task.id}/status`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status }),
+        },
+      )
 
       await readResponse(response)
-      setNotice(`Task #${task.id} marked ${formatStatus(status)}.`)
+      setNotice(`Task #${task.id} updated to ${formatStatus(status)}.`)
+
       await loadTasks()
 
       if (selectedTask?.id === task.id) {
-        await viewActivity(task)
+        await openTaskActivity({ ...task, status })
       }
     } catch (error) {
-      setPageError(getErrorMessage(error))
-    } finally {
-      setUpdatingTaskId(null)
+      setTasksError(
+        error instanceof Error ? error.message : 'Unable to update task.',
+      )
     }
   }
 
-  async function viewActivity(task: Task) {
+  async function openTaskActivity(task: Task) {
     setSelectedTask(task)
-    setTaskEvents([])
+    setTaskActivity([])
     setActivityError('')
-    setLoadingActivity(true)
+    setActivityLoading(true)
 
     try {
-      const response = await fetch(`${API_URL}/api/tasks/${task.id}/activity`)
-      const result = await readResponse<TaskActivityResponse>(response)
-      setTaskEvents(result.events ?? [])
+      const response = await fetch(
+        `${API_URL}/api/tasks/${task.id}/activity`,
+      )
+
+      const payload = await readResponse<TaskActivityResponse>(response)
+      const result = payload.data ?? payload
+
+      setTaskActivity(result.events ?? result.activity ?? [])
     } catch (error) {
-      setActivityError(getErrorMessage(error))
+      setActivityError(
+        error instanceof Error
+          ? error.message
+          : 'Unable to load task activity.',
+      )
     } finally {
-      setLoadingActivity(false)
+      setActivityLoading(false)
     }
   }
 
-  async function handlePdfUpload() {
-    if (!selectedPdf) {
+  async function handlePdfUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setUploadMessage('')
+    setUploadError('')
+
+    if (!selectedFile) {
       setUploadError('Please select a PDF file first.')
       return
     }
 
-    if (selectedPdf.size > MAX_PDF_SIZE) {
-      setUploadError('The PDF must be 10 MB or smaller.')
+    if (!selectedFile.name.toLowerCase().endsWith('.pdf')) {
+      setUploadError('Only PDF files are supported.')
       return
     }
 
-    if (
-      selectedPdf.type !== 'application/pdf' &&
-      !selectedPdf.name.toLowerCase().endsWith('.pdf')
-    ) {
-      setUploadError('Please select a PDF file.')
+    if (selectedFile.size > 10 * 1024 * 1024) {
+      setUploadError('The PDF must be no larger than 10 MB.')
       return
     }
 
-    setUploadingPdf(true)
-    setUploadMessage('')
-    setUploadError('')
-
-    const formData = new FormData()
-    formData.append('file', selectedPdf)
+    setUploadLoading(true)
 
     try {
+      const formData = new FormData()
+      formData.append('file', selectedFile)
+
       const response = await fetch(`${AI_SERVICE_URL}/api/rag/upload`, {
         method: 'POST',
         body: formData,
@@ -255,71 +381,138 @@ function App() {
 
       const result = await readResponse<UploadResponse>(response)
 
-      setUploadMessage(result.message || 'PDF uploaded and indexed successfully.')
-      setSelectedPdf(null)
+      setUploadMessage(
+        result.message ?? `Uploaded and indexed ${selectedFile.name}.`,
+      )
+      setSelectedFile(null)
 
-      const input = document.getElementById('pdf-upload') as HTMLInputElement | null
+      const input = document.getElementById(
+        'pdf-upload',
+      ) as HTMLInputElement | null
+
       if (input) input.value = ''
     } catch (error) {
-      setUploadError(getErrorMessage(error))
+      setUploadError(
+        error instanceof Error ? error.message : 'PDF upload failed.',
+      )
     } finally {
-      setUploadingPdf(false)
+      setUploadLoading(false)
     }
   }
 
-  async function askDocumentQuestion() {
-    if (ragQuestion.trim().length < 3) {
-      setRagError('Enter a question with at least 3 characters.')
+  async function handleRagQuestion(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    const question = ragQuestion.trim()
+
+    if (question.length < 3) {
+      setRagError('Please enter a question with at least 3 characters.')
       return
     }
 
-    setAskingRag(true)
+    setRagLoading(true)
     setRagError('')
-    setRagAnswer('')
-    setRagSources([])
+    setRagResponse(null)
 
     try {
       const response = await fetch(`${AI_SERVICE_URL}/api/rag/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: ragQuestion.trim() }),
+        body: JSON.stringify({ question }),
       })
 
       const result = await readResponse<RagResponse>(response)
-      setRagAnswer(result.answer)
-      setRagSources(result.sources ?? [])
+      setRagResponse(result)
     } catch (error) {
-      setRagError(getErrorMessage(error))
+      setRagError(
+        error instanceof Error
+          ? error.message
+          : 'Unable to query your documents.',
+      )
     } finally {
-      setAskingRag(false)
+      setRagLoading(false)
     }
   }
 
-  const completedTasks = tasks.filter((task) => task.status === 'completed').length
-  const activeTasks = tasks.filter((task) => task.status === 'in_progress').length
-  const pendingTasks = tasks.filter((task) => task.status === 'pending').length
+  async function handleAgentChat(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    const question = agentQuestion.trim()
+
+    if (question.length < 3) {
+      setAgentError('Please enter a question with at least 3 characters.')
+      return
+    }
+
+    setAgentLoading(true)
+    setAgentError('')
+    setAgentAnswer(null)
+
+    try {
+      const response = await fetch(`${AI_SERVICE_URL}/api/agent/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+      })
+
+      const result = await readResponse<AgentChatResponse>(response)
+
+      setAgentAnswer(result)
+      setAgentQuestion('')
+    } catch (error) {
+      setAgentError(
+        error instanceof Error
+          ? error.message
+          : 'Unable to contact the OpsPilot AI agent.',
+      )
+    } finally {
+      setAgentLoading(false)
+    }
+  }
+
+  const completedCount = tasks.filter(
+    (task) => task.status === 'completed',
+  ).length
+
+  const pendingCount = tasks.filter(
+    (task) => task.status === 'pending',
+  ).length
+
+  const inProgressCount = tasks.filter(
+    (task) => task.status === 'in_progress',
+  ).length
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">O</div>
+          <div className="brand-logo">O</div>
           <div>
-            <strong>OpsPilot</strong>
-            <span>AI WORKSPACE</span>
+            <h1>OpsPilot</h1>
+            <span>AI Operations Hub</span>
           </div>
         </div>
 
-        <p className="sidebar-label">WORKSPACE</p>
-        <a className="sidebar-link active" href="#overview">Overview</a>
-        <a className="sidebar-link" href="#tasks">Tasks</a>
-        <a className="sidebar-link" href="#documents">Knowledge base</a>
+        <nav className="sidebar-nav" aria-label="Main navigation">
+          <a className="nav-item active" href="#overview">
+            <span>◫</span> Overview
+          </a>
+          <a className="nav-item" href="#tasks">
+            <span>☷</span> Tasks
+          </a>
+          <a className="nav-item" href="#documents">
+            <span>▤</span> Knowledge Base
+          </a>
+          <a className="nav-item" href="#agent-chat">
+            <span>✧</span> AI Assistant
+          </a>
+        </nav>
 
-        <div className="sidebar-bottom">
-          <div className="avatar">O</div>
+        <div className="sidebar-footer">
+          <div className="sidebar-status-dot" />
           <div>
-            <strong>Workspace user</strong>
-            <span>Local development</span>
+            <strong>Local environment</strong>
+            <span>OpsPilot services</span>
           </div>
         </div>
       </aside>
@@ -327,232 +520,426 @@ function App() {
       <main className="main-content" id="overview">
         <header className="topbar">
           <div>
-            <p className="eyebrow">OPERATIONS WORKSPACE</p>
-            <h1>Good to see you</h1>
-            <p className="muted">Manage work and get answers from your documents.</p>
+            <span className="breadcrumb">Workspace / Overview</span>
+            <h1>Operations Dashboard</h1>
           </div>
-          <div className="status-pill">
-            <span className="status-dot" />
-            Local AI connected
-          </div>
+
+          <button
+            className="refresh-button"
+            type="button"
+            onClick={() => void loadTasks()}
+            disabled={tasksLoading}
+          >
+            {tasksLoading ? 'Refreshing...' : '↻ Refresh'}
+          </button>
         </header>
 
-        {pageError && <div className="error-banner" role="alert">{pageError}</div>}
-        {notice && <div className="success-banner" role="status">{notice}</div>}
+        {notice && (
+          <div className="notice-message" role="status">
+            {notice}
+          </div>
+        )}
 
-        <section className="stats-grid">
+        {tasksError && (
+          <div className="error-message" role="alert">
+            {tasksError}
+          </div>
+        )}
+
+        <section className="stats-grid" aria-label="Task statistics">
           <article className="stat-card">
-            <span className="stat-label">Total tasks</span>
+            <div className="stat-card-top">
+              <span>Total Tasks</span>
+              <span className="stat-icon purple">☷</span>
+            </div>
             <strong>{tasks.length}</strong>
-            <span className="stat-caption">Across your workspace</span>
+            <span className="stat-caption">Tasks in your workspace</span>
           </article>
+
           <article className="stat-card">
-            <span className="stat-label">Pending</span>
-            <strong>{pendingTasks}</strong>
-            <span className="stat-caption">Waiting to start</span>
+            <div className="stat-card-top">
+              <span>Pending</span>
+              <span className="stat-icon orange">◷</span>
+            </div>
+            <strong>{pendingCount}</strong>
+            <span className="stat-caption">Waiting to be started</span>
           </article>
+
           <article className="stat-card">
-            <span className="stat-label">In progress</span>
-            <strong>{activeTasks}</strong>
-            <span className="stat-caption">Currently underway</span>
+            <div className="stat-card-top">
+              <span>In Progress</span>
+              <span className="stat-icon blue">↗</span>
+            </div>
+            <strong>{inProgressCount}</strong>
+            <span className="stat-caption">Currently being worked on</span>
           </article>
+
           <article className="stat-card">
-            <span className="stat-label">Completed</span>
-            <strong>{completedTasks}</strong>
-            <span className="stat-caption">Successfully finished</span>
+            <div className="stat-card-top">
+              <span>Completed</span>
+              <span className="stat-icon green">✓</span>
+            </div>
+            <strong>{completedCount}</strong>
+            <span className="stat-caption">Successfully completed</span>
           </article>
         </section>
 
-        <section className="panel task-create-panel">
-          <div className="panel-heading">
+        <section className="dashboard-card ai-task-card">
+          <div className="section-heading">
             <div>
-              <p className="eyebrow">AI TASK ASSISTANT</p>
-              <h2>What needs to get done?</h2>
-              <p className="muted">Describe the task in plain English and let AI structure it.</p>
+              <span className="section-eyebrow">AI AUTOMATION</span>
+              <h2>Create a task with AI</h2>
+              <p>Describe what needs to be done in natural language.</p>
             </div>
-            <span className="feature-pill">AI powered</span>
+            <div className="section-icon">✧</div>
           </div>
 
-          <form
-            onSubmit={(event) => {
-              event.preventDefault()
-              void createTask()
-            }}
-          >
-            <textarea
-              value={request}
-              onChange={(event) => setRequest(event.target.value)}
-              placeholder="e.g. Investigate slow database queries and mark it as high priority..."
-              rows={3}
-              maxLength={2000}
-            />
-            <div className="form-footer">
-              <span className="muted">Be as descriptive as you need.</span>
-              <button type="submit" disabled={creatingTask || request.trim().length < 3}>
-                {creatingTask ? 'Creating task...' : 'Create task →'}
-              </button>
-            </div>
-          </form>
-        </section>
-
-        <section className="panel upload-panel" id="documents">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">KNOWLEDGE BASE</p>
-              <h2>Upload a document</h2>
-              <p className="muted">Add a PDF to your local AI knowledge base.</p>
-            </div>
-            <span className="feature-pill">PDF · Max 10 MB</span>
-          </div>
-
-          <div className="upload-controls">
+          <form className="task-create-form" onSubmit={handleCreateTask}>
             <input
-              id="pdf-upload"
-              type="file"
-              accept=".pdf,application/pdf"
-              disabled={uploadingPdf}
-              onChange={(event) => {
-                const file = event.target.files?.[0] ?? null
-                setSelectedPdf(file)
-                setUploadMessage('')
-                setUploadError('')
-              }}
+              value={taskRequest}
+              onChange={(event) => setTaskRequest(event.target.value)}
+              placeholder="e.g. Investigate slow database queries with high priority"
+              maxLength={2000}
+              disabled={creatingTask}
+              aria-label="Describe a task"
             />
-
-            <button
-              type="button"
-              onClick={() => void handlePdfUpload()}
-              disabled={!selectedPdf || uploadingPdf}
-            >
-              {uploadingPdf ? 'Indexing PDF...' : 'Upload PDF →'}
+            <button type="submit" disabled={creatingTask}>
+              {creatingTask ? 'Creating...' : '✧ Create Task'}
             </button>
-          </div>
-
-          {selectedPdf && (
-            <p className="upload-file-name">
-              Selected: {selectedPdf.name} · {(selectedPdf.size / (1024 * 1024)).toFixed(2)} MB
-            </p>
-          )}
-
-          {uploadingPdf && (
-            <p className="muted" role="status">
-              Uploading and indexing your document. This may take a little while.
-            </p>
-          )}
-
-          {uploadMessage && <p className="upload-success" role="status">{uploadMessage}</p>}
-          {uploadError && <p className="upload-error" role="alert">{uploadError}</p>}
+          </form>
         </section>
 
-        <section className="panel rag-panel">
-          <div className="panel-heading">
+        <section className="agent-chat" id="agent-chat">
+          <div className="agent-chat-header">
             <div>
-              <p className="eyebrow">KNOWLEDGE ASSISTANT</p>
-              <h2>Ask your documents</h2>
-              <p className="muted">Ask questions about indexed documents and get answers grounded in their content.</p>
+              <span className="agent-chat-eyebrow">OPS INTELLIGENCE</span>
+              <h2>Ask OpsPilot AI</h2>
+              <p>
+                Ask about tasks, task history, or your operations documents.
+                The AI can select MCP tools to help answer your question.
+              </p>
             </div>
-            <span className="feature-pill">RAG + LLAMA 3.2</span>
+            <div className="agent-chat-icon">AI</div>
           </div>
 
-          <form
-            onSubmit={(event) => {
-              event.preventDefault()
-              void askDocumentQuestion()
-            }}
-          >
+          <form className="agent-chat-form" onSubmit={handleAgentChat}>
             <textarea
-              value={ragQuestion}
-              onChange={(event) => setRagQuestion(event.target.value)}
-              placeholder="e.g. What should engineers do when database queries become slow?"
+              value={agentQuestion}
+              onChange={(event) => setAgentQuestion(event.target.value)}
+              placeholder="e.g. Show me all pending tasks or how should I investigate slow database queries?"
               rows={3}
               maxLength={2000}
+              disabled={agentLoading}
+              aria-label="Ask OpsPilot AI a question"
             />
-            <div className="form-footer">
-              <span className="muted">Answers use locally indexed documents.</span>
-              <button type="submit" disabled={askingRag || ragQuestion.trim().length < 3}>
-                {askingRag ? 'Searching documents...' : 'Ask question →'}
+
+            <div className="agent-chat-form-footer">
+              <span>Powered by Ollama and MCP</span>
+              <button type="submit" disabled={agentLoading}>
+                {agentLoading ? 'Thinking...' : 'Ask OpsPilot'}
               </button>
             </div>
           </form>
 
-          {ragError && <p className="upload-error" role="alert">{ragError}</p>}
+          {agentError && (
+            <div className="agent-chat-error" role="alert">
+              {agentError}
+            </div>
+          )}
 
-          {ragAnswer && (
-            <div className="rag-answer">
+          {agentLoading && (
+            <p className="agent-chat-loading" role="status">
+              OpsPilot is analyzing your question and checking available tools...
+            </p>
+          )}
+
+          {agentAnswer && (
+            <div className="agent-chat-answer">
               <h3>Answer</h3>
-              <p className="rag-answer-text">{ragAnswer}</p>
+              <p className="agent-answer-text">{agentAnswer.answer}</p>
 
-              {ragSources.length > 0 && (
-                <div className="rag-sources">
-                  <h3>Sources</h3>
-                  {ragSources.map((source, index) => (
-                    <article
-                      className="rag-source"
-                      key={`${source.source}-${source.chunk_index}-${index}`}
-                    >
-                      <strong>{source.label}: {source.source}</strong>
-                      <p>
-                        Chunk {source.chunk_index}
-                        {source.distance !== undefined
-                          ? ` · Distance: ${source.distance.toFixed(3)}`
-                          : ''}
-                      </p>
-                    </article>
-                  ))}
+              {agentAnswer.tools_used?.length > 0 && (
+                <div className="agent-tools-used">
+                  <h4>Tools used</h4>
+                  <div className="agent-tool-list">
+                    {agentAnswer.tools_used.map((tool, index) => (
+                      <span
+                        className="agent-tool-chip"
+                        key={`${tool.name}-${index}`}
+                        title={JSON.stringify(tool.arguments)}
+                      >
+                        {tool.name}
+                      </span>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
           )}
         </section>
 
-        <section className="panel tasks-panel" id="tasks">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">YOUR WORK</p>
-              <h2>Recent tasks</h2>
-              <p className="muted">Track progress and review task activity.</p>
+        <div className="dashboard-two-column">
+          <section className="dashboard-card" id="documents">
+            <div className="section-heading">
+              <div>
+                <span className="section-eyebrow">KNOWLEDGE BASE</span>
+                <h2>Upload an operations document</h2>
+                <p>Upload a PDF to add it to your RAG knowledge base.</p>
+              </div>
+              <div className="section-icon">▤</div>
             </div>
-            <span className="feature-pill">{tasks.length} tasks</span>
+
+            <form className="upload-form" onSubmit={handlePdfUpload}>
+              <label className="file-picker" htmlFor="pdf-upload">
+                <span className="file-picker-icon">↑</span>
+                <span>
+                  <strong>
+                    {selectedFile ? selectedFile.name : 'Choose a PDF file'}
+                  </strong>
+                  <small>PDF format · Maximum 10 MB</small>
+                </span>
+              </label>
+
+              <input
+                id="pdf-upload"
+                type="file"
+                accept=".pdf,application/pdf"
+                onChange={(event) => {
+                  setSelectedFile(event.target.files?.[0] ?? null)
+                  setUploadMessage('')
+                  setUploadError('')
+                }}
+              />
+
+              <button type="submit" disabled={uploadLoading}>
+                {uploadLoading ? 'Uploading and indexing...' : 'Upload PDF'}
+              </button>
+            </form>
+
+            {uploadMessage && (
+              <p className="success-message" role="status">
+                {uploadMessage}
+              </p>
+            )}
+
+            {uploadError && (
+              <p className="error-message" role="alert">
+                {uploadError}
+              </p>
+            )}
+
+            <div className="subsection-divider" />
+
+            <div className="section-heading compact-heading">
+              <div>
+                <h3>Document Q&amp;A</h3>
+                <p>Ask a question directly against indexed documents.</p>
+              </div>
+            </div>
+
+            <form className="rag-form" onSubmit={handleRagQuestion}>
+              <textarea
+                value={ragQuestion}
+                onChange={(event) => setRagQuestion(event.target.value)}
+                placeholder="e.g. What are the steps for investigating database performance?"
+                rows={3}
+                maxLength={2000}
+                disabled={ragLoading}
+                aria-label="Ask a document question"
+              />
+
+              <button type="submit" disabled={ragLoading}>
+                {ragLoading ? 'Searching documents...' : 'Ask Documents'}
+              </button>
+            </form>
+
+            {ragError && (
+              <p className="error-message" role="alert">
+                {ragError}
+              </p>
+            )}
+
+            {ragResponse && (
+              <div className="rag-answer">
+                <h4>Answer</h4>
+                <p>{ragResponse.answer ?? 'No answer was returned.'}</p>
+
+                {ragResponse.sources && ragResponse.sources.length > 0 && (
+                  <div className="rag-sources">
+                    <strong>Sources</strong>
+                    {ragResponse.sources.map((source, index) => (
+                      <div
+                        className="rag-source"
+                        key={`${source.source ?? source.label ?? 'source'}-${index}`}
+                      >
+                        <span>
+                          {source.label ?? source.source ?? 'Document'}
+                        </span>
+                        {typeof source.chunk_index === 'number' && (
+                          <small>Chunk {source.chunk_index}</small>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+
+          <section className="dashboard-card activity-card">
+            <div className="section-heading">
+              <div>
+                <span className="section-eyebrow">TASK HISTORY</span>
+                <h2>
+                  {selectedTask
+                    ? `Activity · Task #${selectedTask.id}`
+                    : 'Task activity'}
+                </h2>
+                <p>
+                  {selectedTask
+                    ? selectedTask.title
+                    : 'Select a task to inspect its activity history.'}
+                </p>
+              </div>
+
+              {selectedTask && (
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => {
+                    setSelectedTask(null)
+                    setTaskActivity([])
+                    setActivityError('')
+                  }}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+
+            {!selectedTask && (
+              <div className="empty-state">
+                <span className="empty-state-icon">◷</span>
+                <p>Choose View Activity on a task below.</p>
+              </div>
+            )}
+
+            {activityLoading && (
+              <p className="loading-message">Loading task activity...</p>
+            )}
+
+            {activityError && (
+              <p className="error-message" role="alert">
+                {activityError}
+              </p>
+            )}
+
+            {selectedTask && !activityLoading && !activityError && (
+              <div className="activity-list">
+                {taskActivity.length === 0 ? (
+                  <p className="empty-state">
+                    No activity events were returned for this task.
+                  </p>
+                ) : (
+                  taskActivity.map((item, index) => (
+                    <article
+                      className="activity-item"
+                      key={item.id ?? `${item.event_type}-${index}`}
+                    >
+                      <div className="activity-timeline-dot" />
+                      <div className="activity-item-content">
+                        <strong>{formatEventName(item)}</strong>
+                        {item.details != null && (
+                          <p>{formatEventDetails(item.details)}</p>
+                        )}
+                        <small>
+                          {formatDate(item.created_at ?? item.timestamp)}
+                        </small>
+                      </div>
+                    </article>
+                  ))
+                )}
+              </div>
+            )}
+          </section>
+        </div>
+
+        <section className="dashboard-card tasks-card" id="tasks">
+          <div className="section-heading">
+            <div>
+              <span className="section-eyebrow">WORK MANAGEMENT</span>
+              <h2>Recent Tasks</h2>
+              <p>View tasks, update statuses, and inspect their history.</p>
+            </div>
+
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => void loadTasks()}
+              disabled={tasksLoading}
+            >
+              View latest
+            </button>
           </div>
 
-          {loadingTasks ? (
-            <p className="muted">Loading tasks...</p>
+          {tasksLoading ? (
+            <div className="empty-state">
+              <p>Loading tasks...</p>
+            </div>
           ) : tasks.length === 0 ? (
             <div className="empty-state">
-              <h3>No tasks yet</h3>
-              <p>Create your first task using the AI assistant above.</p>
+              <span className="empty-state-icon">☷</span>
+              <p>No tasks are available. Create one using the AI form above.</p>
             </div>
           ) : (
-            <div className="task-list">
+            <div className="tasks-list">
               {tasks.map((task) => (
-                <article className="task-item" key={task.id}>
+                <article className="task-row" key={task.id}>
                   <div className="task-main">
-                    <div className="task-title-row">
+                    <div className="task-title-line">
                       <h3>{task.title}</h3>
-                      <span className={`priority-badge priority-${task.priority}`}>
-                        {task.priority}
-                      </span>
+                      <span className="task-id">#{task.id}</span>
                     </div>
-                    {task.description && <p className="muted">{task.description}</p>}
+
+                    {task.description && (
+                      <p className="task-description">{task.description}</p>
+                    )}
+
                     <div className="task-meta">
-                      <span>Task #{task.id}</span>
-                      <span className={`status-badge status-${task.status}`}>
+                      {task.priority && (
+                        <span
+                          className={`priority-badge ${getPriorityClass(task.priority)}`}
+                        >
+                          {formatStatus(task.priority)} priority
+                        </span>
+                      )}
+
+                      <span
+                        className={`status-badge ${getStatusClass(task.status)}`}
+                      >
                         {formatStatus(task.status)}
                       </span>
                     </div>
                   </div>
 
                   <div className="task-actions">
-                    <label className="sr-only" htmlFor={`status-${task.id}`}>
-                      Update status for {task.title}
+                    <label
+                      className="status-select-label"
+                      htmlFor={`status-${task.id}`}
+                    >
+                      Status
                     </label>
+
                     <select
                       id={`status-${task.id}`}
                       value={task.status}
-                      disabled={updatingTaskId === task.id}
-                      onChange={(event) => {
-                        void updateTaskStatus(task, event.target.value as TaskStatus)
-                      }}
+                      onChange={(event) =>
+                        void handleStatusChange(
+                          task,
+                          event.target.value as TaskStatus,
+                        )
+                      }
+                      aria-label={`Change status for task ${task.id}`}
                     >
                       <option value="pending">Pending</option>
                       <option value="in_progress">In progress</option>
@@ -560,11 +947,11 @@ function App() {
                     </select>
 
                     <button
-                      className="secondary-button"
                       type="button"
-                      onClick={() => void viewActivity(task)}
+                      className="text-button"
+                      onClick={() => void openTaskActivity(task)}
                     >
-                      Activity
+                      View Activity
                     </button>
                   </div>
                 </article>
@@ -573,57 +960,9 @@ function App() {
           )}
         </section>
 
-        {selectedTask && (
-          <section className="panel activity-panel">
-            <div className="panel-heading">
-              <div>
-                <p className="eyebrow">TASK HISTORY</p>
-                <h2>Activity · {selectedTask.title}</h2>
-                <p className="muted">Task #{selectedTask.id}</p>
-              </div>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => {
-                  setSelectedTask(null)
-                  setTaskEvents([])
-                  setActivityError('')
-                }}
-              >
-                Close
-              </button>
-            </div>
-
-            {loadingActivity && <p className="muted">Loading activity...</p>}
-            {activityError && <p className="upload-error" role="alert">{activityError}</p>}
-
-            {!loadingActivity && !activityError && taskEvents.length === 0 && (
-              <p className="muted">No activity has been recorded for this task yet.</p>
-            )}
-
-            {taskEvents.length > 0 && (
-              <div className="activity-list">
-                {taskEvents.map((event) => (
-                  <article className="activity-item" key={event.id}>
-                    <span className="activity-dot" />
-                    <div className="activity-content">
-                      <strong>{formatEventName(event.event_type)}</strong>
-                      {event.details != null && (
-                        <p>{formatEventDetails(event.details)}</p>
-                      )}
-                      <span className="muted">
-                        {new Date(event.created_at).toLocaleString()}
-                      </span>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            )}
-          </section>
-        )}
-
         <footer className="app-footer">
-          OpsPilot AI · Local development workspace
+          <span>OpsPilot AI</span>
+          <span>Local AI · MCP · RAG · Task Automation</span>
         </footer>
       </main>
     </div>
